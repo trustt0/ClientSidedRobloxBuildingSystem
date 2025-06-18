@@ -1,7 +1,7 @@
 # ClientSidedRobloxBuildingSystem
 HiddenDevs-Application-ClientSidedRobloxBuildingSystem
 
-This script implements a building system in my demo game, letting you to place and remove parts, shows a preview part
+This script implements a building system in my demo game, letting you to place and remove parts, shows a preview part, meets application requierments
 
 ## Instructions if u really need them
 
