@@ -1,0 +1,436 @@
+
+--building system
+-- place and remove blocks
+
+--- SERVICES ---
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+
+--- SOME CONFIGURATION ---
+-- for part appearance, snapping, and how fast you can build/remove.
+local PART_SIZE = Vector3.new(4, 4, 4)
+local GRID_SNAP_SIZE = 4
+local PLACEMENT_OFFSET_Y = PART_SIZE.Y / 2
+local PLACEMENT_DEBOUNCE_TIME = 0.2
+local REMOVE_DEBOUNCE_TIME = 0.2
+
+-- Colors and transparency Properties.
+local PREVIEW_COLOR = Color3.fromRGB(100, 150, 255)
+local PLACED_COLOR = Color3.fromRGB(50, 200, 100)
+local PREVIEW_TRANSPARENCY = 0.6
+local PLACED_TRANSPARENCY = 0
+local PART_MATERIAL = Enum.Material.SmoothPlastic
+
+local SPAWNED_PART_TAG = "SpawnedByBuilder"
+
+--- UI ELEMENTS (REFERENCES) ---
+local PlacePartButton: TextButton = nil
+local RemovePartsButton: TextButton = nil
+
+--- STATE VARIABLES, Keeps track of what the builder system is doing. ---
+local Player: Player = nil
+local CurrentMouse: Mouse = nil
+
+local IsPlacementModeActive: boolean = false
+local IsRemovalModeActive: boolean = false
+
+local PreviewPart: { Instance: Part, SetCFrame: (CFrame) -> (), Destroy: () -> () } = nil
+local LastPlacementTime: number = 0
+local LastRemovalTime: number = 0
+
+local HighlightedPart: BasePart = nil
+local PartHighlight: Highlight = nil
+
+local CurrentRotationAngleY: number = 0
+local ROTATION_SNAP_ANGLE = 15
+
+--- FORWARD DECLARATIONS ---
+local StartPlacementMode
+local EndPlacementMode
+local StartRemovalMode
+local EndRemovalMode
+
+---PART (METATABLE) ---
+local Part = {}
+Part.__index = Part
+
+--properties for our Part
+function Part.new(position: CFrame, color: Color3, transparency: number, isAnchored: boolean): (Instance, typeof(Part))
+	local newRobloxPart = Instance.new("Part")
+	newRobloxPart.Size = PART_SIZE
+	newRobloxPart.Material = PART_MATERIAL
+	newRobloxPart.BrickColor = BrickColor.new(color)
+	newRobloxPart.Transparency = transparency
+	newRobloxPart.Anchored = isAnchored
+	newRobloxPart.CFrame = position
+	newRobloxPart.Parent = workspace
+	newRobloxPart.CanCollide = false
+
+	-- Create the object and link it to our Part metatable.
+	local self = setmetatable({
+		Instance = newRobloxPart,
+	}, Part)
+
+	return newRobloxPart, self
+end
+
+--update the Parts position
+function Part:SetCFrame(newCFrame: CFrame)
+	if self.Instance then
+		self.Instance.CFrame = newCFrame
+	end
+end
+
+-- destroy the Roblox Part
+function Part:Destroy()
+	if self.Instance then
+		self.Instance:Destroy()
+		self.Instance = nil
+	end
+end
+
+--- UTILITY FUNCTIONS ---
+
+-- Figures out  where the mouse is pointing wiht raycasting.
+local function GetMouseWorldPosition(): (Vector3, BasePart?)
+	local ray = CurrentMouse.UnitRay
+	local raycastParams = RaycastParams.new()
+
+	-- Filter out the player character,preview block, and the highlight itself
+	local filterList = {Player.Character}
+	if PreviewPart then
+		table.insert(filterList, PreviewPart.Instance)
+	end
+	if PartHighlight then
+		table.insert(filterList, PartHighlight)
+	end
+
+	raycastParams.FilterDescendantsInstances = filterList
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
+	-- Shoot the ray 1000 studs far. 0-0
+	local raycastResult = workspace:Raycast(ray.Origin, ray.Direction * 1000, raycastParams)
+
+	if raycastResult then
+		return raycastResult.Position, raycastResult.Instance
+	end
+	return Vector3.new(0, 0, 0), nil
+end
+
+-- Calculates a grid aligned CFrame for a new block, including its current rotation
+local function CalculateGridCFrame(worldPos: Vector3): CFrame
+	-- Snap X and Z to the grid.
+	local snappedX = math.floor((worldPos.X + GRID_SNAP_SIZE / 2) / GRID_SNAP_SIZE) * GRID_SNAP_SIZE
+	local snappedZ = math.floor((worldPos.Z + GRID_SNAP_SIZE / 2) / GRID_SNAP_SIZE) * GRID_SNAP_SIZE
+
+	local snappedY = worldPos.Y + PLACEMENT_OFFSET_Y
+	
+	return CFrame.new(snappedX, snappedY, snappedZ) * CFrame.Angles(0, math.rad(CurrentRotationAngleY), 0)
+end
+
+-- Creates a perm physical block.
+local function CreatePermanentBlock(position: CFrame, color: Color3, transparency: number, isAnchored: boolean, ownerPlayer: Player): Instance
+	local newPart = Instance.new("Part")
+	newPart.Size = PART_SIZE
+	newPart.Material = PART_MATERIAL
+	newPart.BrickColor = BrickColor.new(color)
+	newPart.Transparency = transparency
+	newPart.CanCollide = true   -- Blocks should have collisions.
+	newPart.Anchored = isAnchored
+	newPart.CFrame = position
+	newPart.Parent = workspace
+
+	-- Add tag for later identification.
+	CollectionService:AddTag(newPart, SPAWNED_PART_TAG)
+
+	-- Embed a StringValue to mark the block owner. -> :)
+	local ownerTag = Instance.new("StringValue")
+	ownerTag.Name = "OwnerId"
+	ownerTag.Value = tostring(ownerPlayer.UserId)
+	ownerTag.Parent = newPart
+
+	print(ownerPlayer.Name .. " placed a block at " .. tostring(position.Position))
+	return newPart
+end
+
+--- CORE LOGIC FUNCTIONS ---
+
+-- Updates the preview block position and rotation.
+local function UpdatePreviewPart()
+	if IsPlacementModeActive and PreviewPart then
+		local worldPos, _ = GetMouseWorldPosition()
+		local snappedCFrame = CalculateGridCFrame(worldPos)
+		PreviewPart:SetCFrame(snappedCFrame)
+	end
+end
+
+-- places a permanent block. has a debounce to prevent placing too fast.
+local function PlaceBlock()
+	local currentTime = tick()
+	if currentTime - LastPlacementTime < PLACEMENT_DEBOUNCE_TIME then
+		return
+	end
+	LastPlacementTime = currentTime
+
+	if IsPlacementModeActive and PreviewPart then
+		local snappedCFrame = PreviewPart.Instance.CFrame
+		CreatePermanentBlock(snappedCFrame, PLACED_COLOR, PLACED_TRANSPARENCY, false, Player)
+	end
+end
+
+-- Manages that red highlight when in removal mode.
+local function UpdateRemovalHighlight()
+	if IsRemovalModeActive then
+		local _, target = GetMouseWorldPosition()
+
+		local newHighlightedPart = nil
+		if target and target:IsA("BasePart") and CollectionService:HasTag(target, SPAWNED_PART_TAG) and target.Parent ~= workspace.Terrain and target.Name ~= "Baseplate" and target.Parent ~= Player.Character then
+			newHighlightedPart = target
+		end
+
+		-- Update the highlight only if the target has changed.
+		if newHighlightedPart ~= HighlightedPart then
+			if PartHighlight then
+				PartHighlight:Destroy()
+				PartHighlight = nil
+			end
+			
+			if newHighlightedPart then
+				PartHighlight = Instance.new("Highlight")
+				PartHighlight.FillColor = Color3.fromRGB(255, 0, 0)
+				PartHighlight.OutlineColor = Color3.fromRGB(255, 100, 100) 
+				PartHighlight.FillTransparency = 0.5
+				PartHighlight.OutlineTransparency = 0
+				PartHighlight.Parent = newHighlightedPart
+			end
+			HighlightedPart = newHighlightedPart
+		end
+	else
+		-- If removal mode is off, make sure any highlight is gone.
+		if PartHighlight then
+			PartHighlight:Destroy()
+			PartHighlight = nil
+		end
+		HighlightedPart = nil
+	end
+end
+
+-- removes a block. Includes debouncing and checks for the tag and ownership.
+local function RemoveBlock()
+	local currentTime = tick()
+	if currentTime - LastRemovalTime < REMOVE_DEBOUNCE_TIME then
+		return
+	end
+	LastRemovalTime = currentTime
+	local target = CurrentMouse.Target
+	
+	-- make sure we only remove blocks created by THIS system and owned by the player yurrr.
+	if target and target:IsA("BasePart") and target.Parent then
+		if CollectionService:HasTag(target, SPAWNED_PART_TAG) then
+			local ownerIdValue = target:FindFirstChild("OwnerId")
+			if ownerIdValue and ownerIdValue:IsA("StringValue") and ownerIdValue.Value == tostring(Player.UserId) then
+				target:Destroy()
+				print(Player.Name .. " deleted one of their blocks.")
+			else
+				warn(Player.Name .. " tried to remove a block not associated with them or incorrectly tagged.")
+			end
+		else
+			warn(Player.Name .. " Dude tried to remove a block without the expected builder tag.")
+		end
+	else
+		warn(Player.Name .. " dude tried to remove an invalid or non existent block.")
+	end
+
+	if PartHighlight then
+		PartHighlight:Destroy()
+		PartHighlight = nil
+	end
+	HighlightedPart = nil
+end
+
+--- MODE MANAGEMENT FUNCTIONS -->> ---
+
+-- Turns on block placement mode.
+StartPlacementMode = function(buttonRef: TextButton)
+	if IsPlacementModeActive then return end
+	if RemovePartsButton and IsRemovalModeActive then
+		EndRemovalMode(RemovePartsButton) -- Turn off removal mode first if on
+	end
+
+	IsPlacementModeActive = true
+	buttonRef.Text = "Placing... (Press X to stop)"
+	buttonRef.BackgroundColor3 = Color3.fromRGB(255, 150, 0)
+	CurrentMouse.TargetFilter = nil
+
+	CurrentRotationAngleY = 0 
+
+	-- Creates the preview part.
+	local robloxPart, luaPart = Part.new(CFrame.new(0, -1000, 0), PREVIEW_COLOR, PREVIEW_TRANSPARENCY, true)
+	PreviewPart = luaPart
+	robloxPart.Name = "BlockPreview"
+	robloxPart.Parent = workspace	
+	RunService:BindToRenderStep("UpdatePreview", Enum.RenderPriority.Input.Value, UpdatePreviewPart)
+	game.StarterGui:SetCore("SendNotification", {Title = "Mode Switched", Text = "Placement mode is ON. Click to drop blocks. Press X to exit."})
+end
+
+-- Turns off block placement mode.
+EndPlacementMode = function(buttonRef: TextButton)
+	if not IsPlacementModeActive then return end
+
+	IsPlacementModeActive = false
+	if buttonRef then
+		buttonRef.Text = "Place Part"
+		buttonRef.BackgroundColor3 = Color3.fromRGB(85, 170, 255)
+	end
+
+	if PreviewPart then
+		RunService:UnbindFromRenderStep("UpdatePreview") 
+		PreviewPart:Destroy()
+		PreviewPart = nil
+	end
+
+	game.StarterGui:SetCore("SendNotification", {Title = "Mode Switched", Text = "Placement mode is OFF Ya Heard yuh"})
+end
+
+-- Turns on block removal mode.
+StartRemovalMode = function(buttonRef: TextButton)
+	if IsRemovalModeActive then return end
+	if PlacePartButton and IsPlacementModeActive then
+		EndPlacementMode(PlacePartButton) -- Turn off placement mode first.
+	end
+
+	IsRemovalModeActive = true
+	buttonRef.Text = "Removing... (Press X to stop)"
+	buttonRef.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+	CurrentMouse.TargetFilter = nil
+	RunService:BindToRenderStep("UpdateRemovalHighlight", Enum.RenderPriority.Input.Value, UpdateRemovalHighlight)
+
+	game.StarterGui:SetCore("SendNotification", {Title = "Mode Switched", Text = "Removal mode is ON. Click to delete blocks. Press X to exit."})
+end
+
+-- Turns off block removal mode.
+EndRemovalMode = function(buttonRef: TextButton)
+	if not IsRemovalModeActive then return end
+
+	IsRemovalModeActive = false
+	if buttonRef then
+		buttonRef.Text = "Remove Parts"
+		buttonRef.BackgroundColor3 = Color3.fromRGB(255, 170, 85)
+	end
+
+	RunService:UnbindFromRenderStep("UpdateRemovalHighlight")
+	if PartHighlight then
+		PartHighlight:Destroy()
+		PartHighlight = nil
+	end
+	HighlightedPart = nil
+
+	game.StarterGui:SetCore("SendNotification", {Title = "Mode Switched", Text = "Removal mode is OFF yu Heard."})
+end
+
+--- INITIALIZATIONN! ---
+
+-- Sets everything up: UI, player info, and input event connections.
+local function SetupUI()
+	Player = Players.LocalPlayer
+	local character = Player.Character or Player.CharacterAdded:Wait()
+	CurrentMouse = Player:GetMouse()
+
+	local PlayerGui = Player:WaitForChild("PlayerGui")
+	local MainScreenGui = PlayerGui:WaitForChild("MainScreenGui", 10)
+	if not MainScreenGui then
+		error("MainScreenGui not found. Check your UI setup!")
+	end
+
+	PlacePartButton = MainScreenGui:WaitForChild("PlacePartButton", 10)
+	if not PlacePartButton then
+		error("PlacePartButton not found. Check your UI setup!")
+	end
+	PlacePartButton.TextScaled = true -- Make sure text fits the button.
+
+	RemovePartsButton = MainScreenGui:WaitForChild("RemovePartsButton", 10)
+	if not RemovePartsButton then
+		error("RemovePartsButton not found. Check your UI setup!")
+	end
+	RemovePartsButton.TextScaled = true
+
+	--- EVENT CONNECTIONS ->>! ---
+	-- How player input and UI actions trigger the script.
+
+	-- Connect UI buttons
+	PlacePartButton.MouseButton1Click:Connect(function()
+		StartPlacementMode(PlacePartButton)
+	end)
+
+	RemovePartsButton.MouseButton1Click:Connect(function()
+		StartRemovalMode(RemovePartsButton)
+	end)
+
+	-- Connect to UserInputService for keyboard and mouse input.
+	UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessedEvent: boolean)
+
+		-- Handle clicks, left mousebutton.
+		if input.UserInputType == Enum.UserInputType.MouseButton1 and not gameProcessedEvent then
+			if IsPlacementModeActive then
+				PlaceBlock()
+			elseif IsRemovalModeActive then
+				RemoveBlock()
+			end
+		end
+
+		-- Handles n the X key press to exit any active building mode.
+		if input.KeyCode == Enum.KeyCode.X and (IsPlacementModeActive or IsRemovalModeActive) then
+			if IsPlacementModeActive then
+				EndPlacementMode(PlacePartButton)
+			end
+			if IsRemovalModeActive then
+				EndRemovalMode(RemovePartsButton)
+			end
+		end
+
+		-- Handles the R key press to rotate the preview block forward
+		if input.KeyCode == Enum.KeyCode.R and not gameProcessedEvent then
+			if IsPlacementModeActive then
+				CurrentRotationAngleY = CurrentRotationAngleY + ROTATION_SNAP_ANGLE
+				if CurrentRotationAngleY >= 360 then
+					CurrentRotationAngleY = 0 
+				end
+				UpdatePreviewPart()
+			end
+		end
+
+		-- Handles Q key press to rotate the preview block backward
+		if input.KeyCode == Enum.KeyCode.Q and not gameProcessedEvent then
+			if IsPlacementModeActive then
+				CurrentRotationAngleY = CurrentRotationAngleY - ROTATION_SNAP_ANGLE
+				if CurrentRotationAngleY < 0 then
+					CurrentRotationAngleY = 360 + CurrentRotationAngleY
+				end
+				UpdatePreviewPart() 
+			end
+		end
+	end)
+
+	-- Clean up active modes if the players character is removed yur
+	Player.CharacterRemoving:Connect(function()
+		if PlacePartButton then
+			EndPlacementMode(PlacePartButton)
+		end
+		if RemovePartsButton then
+			EndRemovalMode(RemovePartsButton)
+		end
+	end)
+
+	-- Initial notifications to the player.
+	game.StarterGui:SetCore("SendNotification", {Title = "System Ready", Text = "Builder System script loaded."})
+
+	game.StarterGui:SetCore("SendNotification", {
+		Title = "hi heres build instruction!",
+		Text = "Click 'Place Part' to build (R to rotate forward, Q to rotate back). Click 'Remove Parts' to delete blocks. Press X to exit any mode.",
+		Duration = 5
+	})
+end
+
+task.spawn(SetupUI)
